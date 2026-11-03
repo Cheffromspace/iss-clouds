@@ -11,7 +11,7 @@ hour over the previous days. Pass those files as --past.
 Output: two 2048 x 2048 RGB PNGs, west.png (180 W to 0) and east.png (0 to 180 E), each covering the full
 90 N to 90 S. Together they make a 4096 x 2048 equirectangular map, close to the source's own resolution, within
 VRChat's 2048 x 2048 limit per downloaded image. Red is cloud opacity (1 = opaque); green is cloud-top height,
-0-16 km. Blue is unused. Beyond the mosaic's latitude
+0-16 km. Blue is a constant 128, a marker for the sRGB check in the sky shader. Beyond the mosaic's latitude
 range the image is black and the world falls back to its fixed map.
 
     python tools/live_clouds.py --fetch --out folder       # latest hour, straight from NOAA
@@ -27,6 +27,7 @@ import urllib.request
 import h5py
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 
 W, H = 4096, 2048
 BUCKET = "https://noaa-gmgsi-pds.s3.amazonaws.com"
@@ -131,10 +132,19 @@ def main():
     past = [load(f)[0] for f in a.past]
     op, top = clouds(now, past)
     img = to_equirect(op, lat, lon)
+    # Heights come in whole counts (about 100 m), which show as contour rings where lighting changes fast with height
+    # (at sunset). Smooth them, and dither both channels so 8 bits don't band.
+    top = ndimage.gaussian_filter(top, 1.5)
     height = to_equirect(top / TOP_KM, lat, lon)
+    rng = np.random.default_rng(0)
+    img = img + (rng.random(img.shape) - 0.5) / 255.0
+    height = height + (rng.random(height.shape) - 0.5) / 255.0
     px = np.zeros((H, W, 3), np.uint8)
     px[..., 0] = (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
     px[..., 1] = (np.clip(height, 0, 1) * 255 + 0.5).astype(np.uint8)
+    # Blue is a constant 0.5 so the sky shader can tell whether VRChat decoded the image as sRGB (it then reads ~0.21)
+    # and undo it.
+    px[..., 2] = 128
     os.makedirs(a.out, exist_ok=True)
     Image.fromarray(px[:, : W // 2]).save(os.path.join(a.out, "west.png"), optimize=True)
     Image.fromarray(px[:, W // 2 :]).save(os.path.join(a.out, "east.png"), optimize=True)
