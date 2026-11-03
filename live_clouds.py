@@ -131,6 +131,10 @@ def main():
     now, lat, lon = load(a.now)
     past = [load(f)[0] for f in a.past]
     op, top = clouds(now, past)
+    # Cover is nearly all-or-nothing from one source pixel to the next, so an edge falls inside a single pixel and the
+    # sky shader's threshold traces the pixel staircase (right angles). A slight blur spreads each edge over a few
+    # pixels, so the shader's noise shapes it instead of the grid.
+    op = ndimage.gaussian_filter(op, 1.3)
     img = to_equirect(op, lat, lon)
     # Heights come in whole counts (about 100 m), which show as contour rings where lighting changes fast with height
     # (at sunset). Smooth them, and dither both channels so 8 bits don't band.
