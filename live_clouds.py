@@ -93,6 +93,41 @@ def clouds(now, past):
     return np.nan_to_num(op, nan=0.0), np.nan_to_num(top, nan=0.5)
 
 
+def deseam(op, top):
+    """Hides the joins between satellites in the mosaic.
+
+    Each satellite sees the same cloud top at a different angle, so where the mosaic switches from one to the next
+    (about 137 W, 22 E and 93 E) the heights, and sometimes the opacity, step by up to a kilometre along a straight
+    meridian. In the world that draws as a crease across every cloud deck it crosses. Finds those columns from the
+    data itself (a column where cloud tops jump between neighbours in far more rows than usual), then blends each
+    field across the join: the two sides are shifted to meet, and the shift fades out over about 60 km each way.
+    """
+    cloudy = op > 0.3
+    both = cloudy[:, 1:] & cloudy[:, :-1]
+    rows = np.maximum(both.sum(axis=0), 1)
+    for field, least in ((top, 0.3), (op, 0.08)):
+        # The mean signed step between neighbouring columns over rows where both are cloudy. Pixel noise averages
+        # out; a join keeps its sign down the whole column. Real cloud edges don't line up along a meridian.
+        mean_step = (np.diff(field, axis=1) * both).sum(axis=0) / rows
+        mean_step[rows < 200] = 0.0
+        size = np.abs(mean_step)
+        floor = max(15.0 * np.median(size[rows >= 200]), least)
+        seams = [c for c in np.argsort(size)[::-1][:12] if size[c] > floor and size[c] >= size[max(c - 5, 0):c + 6].max()]
+        for c in seams:
+            # The mosaic already blends the two satellites over about 25 columns, so the join is an S-curve, not a
+            # step. Take the mean profile across it over rows cloudy on both sides, and subtract whatever departs
+            # from a straight line between the two plateaus: the 2 km drop then spreads over 650 km, which is flat.
+            lo, hi = max(c - 45, 0), min(c + 46, field.shape[1])
+            ok = (op[:, lo:lo + 20].mean(axis=1) > 0.3) & (op[:, hi - 20:hi].mean(axis=1) > 0.3)
+            if ok.sum() < 100:
+                continue
+            profile = field[ok][:, lo:hi].mean(axis=0)
+            line = np.linspace(profile[:5].mean(), profile[-5:].mean(), hi - lo)
+            field[:, lo:hi] -= (profile - line)[None, :]
+            print(f"seam at column {c} (mean step {mean_step[c]:+.2f}, {profile[:5].mean() - profile[-5:].mean():+.2f} across) flattened")
+    return np.clip(op, 0.0, 1.0), top
+
+
 def to_equirect(op, lat, lon):
     # Resample the source grid to a full-globe equirectangular map: column 0 at 180 W, row 0 at 90 N.
     rows = H
@@ -131,6 +166,7 @@ def main():
     now, lat, lon = load(a.now)
     past = [load(f)[0] for f in a.past]
     op, top = clouds(now, past)
+    op, top = deseam(op, top)
     # Cover is nearly all-or-nothing from one source pixel to the next, so an edge falls inside a single pixel and the
     # sky shader's threshold traces the pixel staircase (right angles). A slight blur spreads each edge over a few
     # pixels, so the shader's noise shapes it instead of the grid.
