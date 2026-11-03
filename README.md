@@ -6,4 +6,4 @@ Hourly global cloud images for the ISS VRChat world, made from NOAA's Global Mos
 - https://cheffromspace.github.io/iss-clouds/east.png (0° to 180° E)
 - https://cheffromspace.github.io/iss-clouds/time.txt (the hour shown, UTC)
 
-Each image is 2048 × 2048 greyscale, equirectangular from 90° N to 90° S; white is cloud. Data: NOAA/NESDIS.
+Each image is 2048 × 2048 RGB, equirectangular from 90° N to 90° S. Red is cloud opacity; green is cloud-top height from 0 to 16 km. Data: NOAA/NESDIS.

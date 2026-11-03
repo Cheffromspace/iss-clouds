@@ -8,9 +8,10 @@ Infrared sees cloud tops as colder (brighter) than the ground. Cold clear ground
 mountains) is bright too, so each pixel is compared with its clear-sky value: the warmest reading at the same
 hour over the previous days. Pass those files as --past.
 
-Output: two 2048 x 2048 greyscale PNGs, west.png (180 W to 0) and east.png (0 to 180 E), each covering the full
+Output: two 2048 x 2048 RGB PNGs, west.png (180 W to 0) and east.png (0 to 180 E), each covering the full
 90 N to 90 S. Together they make a 4096 x 2048 equirectangular map, close to the source's own resolution, within
-VRChat's 2048 x 2048 limit per downloaded image. White is cloud opacity 1. Beyond the mosaic's latitude
+VRChat's 2048 x 2048 limit per downloaded image. Red is cloud opacity (1 = opaque); green is cloud-top height,
+0-16 km. Blue is unused. Beyond the mosaic's latitude
 range the image is black and the world falls back to its fixed map.
 
     python tools/live_clouds.py --fetch --out folder       # latest hour, straight from NOAA
@@ -73,13 +74,22 @@ def smoothstep(a, b, x):
     return t * t * (3.0 - 2.0 * t)
 
 
-def opacity(now, past):
+# Cloud-top height from how much colder the top is than the clear-sky ground. Clear tropical ocean reads about 67 and
+# the coldest storm tops about 232, roughly 295 K and 195 K, so about 1.65 counts per kelvin. Air cools about 6.5 K
+# per km, which makes about 10.5 counts per km.
+COUNTS_PER_KM = 10.5
+TOP_KM = 16.0   # the height stored as 1.0; the sky shader uses the same scale
+
+
+def clouds(now, past):
+    """Returns (opacity 0-1, cloud-top height in km)."""
     # Counts run 0-255 with colder (higher) as brighter. Clear sky is the lowest count seen at this hour lately.
     clear = np.nanmin(np.stack(past + [now]), axis=0) if past else np.full_like(now, 70.0)
     rise = now - clear
     # A rise over clear sky means cloud. Very cold tops are cloud whatever the clear-sky value says.
     op = np.maximum(smoothstep(6.0, 45.0, rise), smoothstep(150.0, 205.0, now))
-    return np.nan_to_num(op, nan=0.0)
+    top = np.clip(np.maximum(rise, (now - 70.0) * 0.8) / COUNTS_PER_KM, 0.5, TOP_KM)
+    return np.nan_to_num(op, nan=0.0), np.nan_to_num(top, nan=0.5)
 
 
 def to_equirect(op, lat, lon):
@@ -119,8 +129,12 @@ def main():
         a.now, a.past, hour = fetch(tmp.name)
     now, lat, lon = load(a.now)
     past = [load(f)[0] for f in a.past]
-    img = to_equirect(opacity(now, past), lat, lon)
-    px = (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
+    op, top = clouds(now, past)
+    img = to_equirect(op, lat, lon)
+    height = to_equirect(top / TOP_KM, lat, lon)
+    px = np.zeros((H, W, 3), np.uint8)
+    px[..., 0] = (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
+    px[..., 1] = (np.clip(height, 0, 1) * 255 + 0.5).astype(np.uint8)
     os.makedirs(a.out, exist_ok=True)
     Image.fromarray(px[:, : W // 2]).save(os.path.join(a.out, "west.png"), optimize=True)
     Image.fromarray(px[:, W // 2 :]).save(os.path.join(a.out, "east.png"), optimize=True)
