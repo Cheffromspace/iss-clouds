@@ -274,8 +274,28 @@ def fetch_jma():
                     "kt": kt10, "move": course if move_deg is not None else "",
                     "move_deg": move_deg, "move_kt": num((now.get("speed") or {}).get("kt")),
                     "pressure": num(now.get("pressure")), "extratropical": cat == "LOW",
-                    "updated": parse_time((now.get("validtime") or {}).get("UTC")), "id": f"jma-{tc['tropicalCyclone']}"})
+                    "updated": parse_time((now.get("validtime") or {}).get("UTC")), "id": f"jma-{tc['tropicalCyclone']}",
+                    "track": jma_track(spec)})
     return out
+
+
+def jma_track(spec):
+    """JMA's forecast points (12, 24, 45, 69, 93, 117 h or fewer) as (time, lat, lon, kt); [] if unreadable."""
+    try:
+        pts = []
+        for x in spec:
+            if not isinstance(x.get("advancedHours"), (int, float)) or x["advancedHours"] <= 0:
+                continue
+            deg = (x.get("position") or {}).get("deg")
+            t = parse_time((x.get("validtime") or {}).get("UTC"))
+            if not deg or t is None:
+                continue
+            kt = num(((x.get("maximumWind") or {}).get("sustained") or {}).get("kt"))
+            pts.append((t, float(deg[0]), float(deg[1]), kt))
+        return sorted(pts)
+    except Exception as e:
+        log(f"JMA track unreadable ({type(e).__name__}: {e})")
+        return []
 
 
 def fetch_jtwc_final():
@@ -286,6 +306,76 @@ def fetch_jtwc_final():
         if re.search(r"final\s+warning", m.group(2), re.I):
             ended.add(storm_key(m.group(1)))
     return ended
+
+
+JTWC_POSIT = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\s*-{2,}\s*(?:NEAR\s+)?(\d{1,2}(?:\.\d+)?)\s*([NS])\s+"
+                        r"(\d{1,3}(?:\.\d+)?)\s*([EW])")
+
+
+def jtwc_day(dd, hh, mi, ref):
+    """The UTC time for JTWC's DDHHMMZ: the month that puts it nearest ref."""
+    best = None
+    for months in (-1, 0, 1):
+        y, m = ref.year, ref.month + months
+        y, m = y + (m - 1) // 12, (m - 1) % 12 + 1
+        try:
+            t = datetime.datetime(y, m, dd, hh, mi, tzinfo=datetime.timezone.utc)
+        except ValueError:
+            continue
+        if best is None or abs((t - ref).total_seconds()) < abs((best - ref).total_seconds()):
+            best = t
+    return best
+
+
+def parse_jtwc_warning(text, ref=None):
+    """A JTWC warning text (WTPN31 PGTW etc.): {"key", "lat", "lon", "t", "track": [(time, lat, lon, kt)]}, or None
+    if it isn't a numbered warning with a position. The track is the FORECASTS section's points (12 h to 120 h), each
+    with the "MAX SUSTAINED WINDS - nnn KT" that follows it; a dissipated point without a position is skipped."""
+    ref = ref or NOW
+    text = text.replace("\r", "")
+    head = re.search(r"\b\d\.\s+(.*?)\s+\(([^)]+)\)\s+WARNING\s+NR\s*\d+", text)
+    if not head or "FORECASTS:" not in text:
+        return None
+    now_part, fc = text.split("FORECASTS:", 1)
+    fc = re.split(r"\bREMARKS:", fc)[0]
+    fix = JTWC_POSIT.search(now_part)
+    if not fix:
+        return None
+
+    def point(m):
+        lat = float(m.group(4)) * (-1 if m.group(5) == "S" else 1)
+        lon = float(m.group(6)) * (-1 if m.group(7) == "W" else 1)
+        return jtwc_day(int(m.group(1)), int(m.group(2)), int(m.group(3)), ref), lat, lon
+
+    t0, lat0, lon0 = point(fix)
+    hits = list(JTWC_POSIT.finditer(fc))
+    track = []
+    for i, m in enumerate(hits):
+        seg = fc[m.end(): hits[i + 1].start() if i + 1 < len(hits) else len(fc)]
+        w = re.search(r"MAX\s+SUSTAINED\s+WINDS\s*-\s*(\d+)\s*KT", seg)
+        t, lat, lon = point(m)
+        if t and t > t0:
+            track.append((t, lat, lon, float(w.group(1)) if w else None))
+    return {"key": storm_key(head.group(2)), "name": head.group(2), "t": t0, "lat": lat0, "lon": lon0,
+            "track": sorted(track)}
+
+
+def fetch_jtwc_warnings():
+    """The current numbered warnings, from the warning texts the RSS feed links (wp3026web.txt and the like; the
+    invest numbers 90-99 are formation alerts, which carry no forecast track). A text that fails is skipped."""
+    rss = get(JTWC_RSS_URL).decode("utf-8", "replace")
+    out = []
+    for url in dict.fromkeys(re.findall(r"https?://[^'\"\s<>]+/products/[a-z]{2}\d{4}web\.txt", rss)):
+        if int(re.search(r"([a-z]{2})(\d{2})\d{2}web", url).group(2)) >= 90:
+            continue
+        try:
+            w = parse_jtwc_warning(get(url, timeout=30).decode("utf-8", "replace"))
+        except Exception as e:
+            log(f"JTWC warning {url.rsplit('/', 1)[-1]}: FAILED ({type(e).__name__}: {e})")
+            continue
+        if w:
+            out.append(w)
+    return out
 
 
 def eonet_tracks(features):
@@ -331,10 +421,11 @@ def eonet_storms(tracks):
     return out
 
 
-def cyclones(gdacs, nhc, eon, jma=(), jtwc_ended=frozenset()):
+def cyclones(gdacs, nhc, eon, jma=(), jtwc_ended=frozenset(), jtwc_warnings=()):
     """Merge the lists by name, or by position within 300 km. NHC's numbers beat EONET's beat GDACS's peak; the
     freshest position wins. Storms JMA calls extratropical are relabelled "Former storm ...". Storms JTWC has finished
-    with that nobody has a fix for in the last 6 h, and any storm whose newest fix is over STALE_HOURS old, are dropped."""
+    with that nobody has a fix for in the last 6 h, and any storm whose newest fix is over STALE_HOURS old, are dropped.
+    Each storm carries the forecast track of the agency whose fix it shows (see forecast_track)."""
     merged = []
 
     def find(c):
@@ -344,25 +435,25 @@ def cyclones(gdacs, nhc, eon, jma=(), jtwc_ended=frozenset()):
         return None
 
     for c in gdacs:
-        merged.append(dict(c))
+        merged.append(dict(c, fix="GDACS"))
     for c in eon:
         m = find(c)
         if m is None:
-            merged.append(dict(c, alert="", peak_kt=None, sources=["EONET"]))
+            merged.append(dict(c, alert="", peak_kt=None, sources=["EONET"], fix="EONET"))
             continue
         if c["updated"] and (m["updated"] is None or c["updated"] >= m["updated"]):
-            m.update(lat=c["lat"], lon=c["lon"], updated=c["updated"])
+            m.update(lat=c["lat"], lon=c["lon"], updated=c["updated"], fix="EONET")
         m.update(kt=c["kt"], move=c["move"] or m.get("move", ""), start=m.get("start") or c["start"],
                  move_deg=c.get("move_deg"), move_kt=c.get("move_kt"))
         m["sources"].append("EONET")
     for c in jma:
         m = find(c)
         if m is None:
-            merged.append(dict(c, alert="", peak_kt=None, start=c["updated"], sources=["JMA"]))
+            merged.append(dict(c, alert="", peak_kt=None, start=c["updated"], sources=["JMA"], fix="JMA"))
             continue
         if c["updated"] and (m["updated"] is None or c["updated"] >= m["updated"]):
             m.update(lat=c["lat"], lon=c["lon"], updated=c["updated"], move=c["move"] or m.get("move", ""),
-                     move_deg=c["move_deg"], move_kt=c["move_kt"], move_mph=None)
+                     move_deg=c["move_deg"], move_kt=c["move_kt"], move_mph=None, fix="JMA", track=c.get("track"))
             if c["kt"] or c["extratropical"]:
                 m["kt"] = c["kt"]
         m.update(extratropical=c["extratropical"], pressure=c["pressure"])
@@ -370,9 +461,9 @@ def cyclones(gdacs, nhc, eon, jma=(), jtwc_ended=frozenset()):
     for c in nhc:
         m = find(c)
         if m is None:
-            merged.append(dict(c, alert="", peak_kt=None, start=c["updated"], sources=["NHC"]))
+            merged.append(dict(c, alert="", peak_kt=None, start=c["updated"], sources=["NHC"], fix="NHC"))
             continue
-        m.update(lat=c["lat"], lon=c["lon"], kt=c["kt"] or m.get("kt"), move=c["move"] or m.get("move", ""),
+        m.update(lat=c["lat"], lon=c["lon"], fix="NHC", kt=c["kt"] or m.get("kt"), move=c["move"] or m.get("move", ""),
                  move_mph=c.get("move_mph"), cls=c["cls"], updated=c["updated"] or m["updated"], name=c["name"],
                  move_deg=c["move_deg"] if c.get("move_deg") is not None else m.get("move_deg"),
                  move_kt=c["move_kt"] if c.get("move_kt") is not None else m.get("move_kt"))
@@ -421,8 +512,35 @@ def cyclones(gdacs, nhc, eon, jma=(), jtwc_ended=frozenset()):
         # No swirl for a storm gone extratropical: its winds and shape no longer fit a tropical vortex.
         ev.update(storm_fields(None if m.get("extratropical") else kt or m.get("peak_kt"), m["lat"],
                                m.get("move_deg"), m.get("move_kt")))
+        try:
+            track = forecast_track(m, jtwc_warnings)
+        except Exception as e:   # a track is a nicety: the storm stays listed without one
+            log(f"cyclone {m['name']}: track skipped ({type(e).__name__}: {e})")
+            track = []
+        if track:
+            ev["track"] = track
         out.append(ev)
     return out
+
+
+def forecast_track(m, jtwc_warnings):
+    """The forecast points after the storm's fix, from the agency that gave the fix: JMA's own forecast when the
+    position is JMA's; otherwise a JTWC warning for the same storm (by name, or its warning position within 300 km),
+    which is where GDACS's and EONET's positions outside NHC's basins come from. NHC's fixes take JTWC's track too
+    when JTWC warns on the storm (it re-issues NHC/CPHC's forecast for the central Pacific). Points as the contract
+    in docs/FORECAST-FORMAT.md: {"t": "YYYY-MM-DDTHH:MMZ", "lat", "lon", "wind_kt" (-1 unknown)}."""
+    pts = []
+    if m.get("fix") == "JMA":
+        pts = m.get("track") or []
+    else:
+        for w in jtwc_warnings:
+            if (m["key"] and w["key"] == m["key"]) or km_between(w["lat"], w["lon"], m["lat"], m["lon"]) < 300:
+                pts = w["track"]
+                break
+    after = m.get("updated") or NOW
+    return [{"t": t.strftime("%Y-%m-%dT%H:%MZ"), "lat": round(lat, 2), "lon": round(((lon + 180.0) % 360.0) - 180.0, 2),
+             "wind_kt": round(kt) if kt is not None else -1}
+            for t, lat, lon, kt in pts if t > after][:8]
 
 
 def storm_fields(kt, lat, move_deg, move_kt):
@@ -827,7 +945,8 @@ def build(clouds_dir, kinds=SHOWN_KINDS):
     eon_storms, _ = attempt("EONET storms", eonet_storms, tracks)
     jm, ok["JMA"] = attempt("JMA", fetch_jma)
     jt, ok["JTWC"] = attempt("JTWC final warnings", lambda: [fetch_jtwc_final()])
-    events, _ = attempt("cyclone merge", cyclones, gd, nh, eon_storms, jm, jt[0] if jt else frozenset())
+    jw, _ = attempt("JTWC warning tracks", fetch_jtwc_warnings)
+    events, _ = attempt("cyclone merge", cyclones, gd, nh, eon_storms, jm, jt[0] if jt else frozenset(), jw)
     hot = bool(kinds & {"fire", "volcano"})
     others, _ = attempt("EONET events", eonet_others, tracks, not hot)
     if hot:
