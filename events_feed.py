@@ -8,6 +8,8 @@ Meant to run in the hourly iss-clouds job after live_clouds.py and be published 
 Sources (all free, no key):
   GDACS tropical cyclones (EU JRC / UN), every basin
   NHC CurrentStorms.json, detail for Atlantic and east/central Pacific storms
+  JMA bosai typhoon JSON (the WMO centre for the west Pacific): fresh positions, and when a typhoon turns extratropical
+  JTWC's RSS feed: which storms have had their final warning
   NASA EONET v3: wildfires, volcanoes, sea ice (icebergs), dust/haze, and storms GDACS doesn't list yet
   USGS M4.5+ past day: M6+ or significant only
   NOAA SWPC planetary Kp and OVATION nowcast: the "aurora" block the sky draws every hour, and an event when Kp >= 5
@@ -42,6 +44,11 @@ MAX_BYTES = 16 * 1024
 
 GDACS_URL = "https://www.gdacs.org/gdacsapi/api/events/geteventlist/SEARCH?eventlist=TC"
 NHC_URL = "https://www.nhc.noaa.gov/CurrentStorms.json"
+JMA_LIST_URL = "https://www.jma.go.jp/bosai/typhoon/data/targetTc.json"
+JMA_TC_URL = "https://www.jma.go.jp/bosai/typhoon/data/{}/specifications.json"
+JTWC_RSS_URL = "https://www.metoc.navy.mil/jtwc/rss/jtwc.rss"
+# A fix older than this isn't where the storm is now (a recurving storm moves 500 km in 12 h), so it isn't listed.
+STALE_HOURS = 12
 # Two narrower queries instead of the whole open list (about 9 MB, mostly years-old US fire reports).
 EONET_RECENT_URL = ("https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=open&days=21"
                     "&category=wildfires,severeStorms,dustHaze")
@@ -54,6 +61,8 @@ CLOUDS_URL = "https://cheffromspace.github.io/iss-clouds/"
 CREDITS = {
     "GDACS": "GDACS (EU JRC / UN)",
     "NHC": "NOAA National Hurricane Center",
+    "JMA": "Japan Meteorological Agency",
+    "JTWC": "Joint Typhoon Warning Center",
     "EONET": "NASA EONET",
     "USGS": "USGS Earthquake Hazards Program",
     "SWPC": "NOAA Space Weather Prediction Center",
@@ -234,9 +243,49 @@ def fetch_nhc():
         mdir, mspd = num(s.get("movementDir")), num(s.get("movementSpeed"))
         out.append({"key": storm_key(s.get("name", "")), "name": storm_name(s.get("name") or ""),
                     "lat": lat, "lon": lon, "kt": num(s.get("intensity")), "cls": str(s.get("classification") or ""),
-                    "move": compass(mdir) if mdir is not None else "", "move_mph": mspd,
+                    "move": compass(mdir) if mdir is not None else "", "move_mph": mspd, "move_deg": mdir,
+                    "move_kt": mspd * 0.869 if mspd is not None else None,
                     "updated": parse_time(s.get("lastUpdate")), "id": f"nhc-{s.get('id') or storm_key(s.get('name'))}"})
     return out
+
+
+JMA_COMPASS = {"\u5317": "N", "\u6771": "E", "\u5357": "S", "\u897f": "W"}   # the kanji for N, E, S, W
+DIRS16 = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+def fetch_jma():
+    """West Pacific storms from JMA's own JSON. category.en is TD, TS, STS, TY, or LOW once it's extratropical.
+    JMA's winds are 10-minute means, about 12 % below the 1-minute winds the US centres give; they're kept as JMA
+    states them, so the class shown matches JMA's own (30 kt is a depression, not a 34 kt tropical storm)."""
+    out = []
+    for tc in get_json(JMA_LIST_URL):
+        spec = get_json(JMA_TC_URL.format(tc["tropicalCyclone"]))
+        title = next((x for x in spec if x.get("part") == "title"), {})
+        now = next((x for x in spec if x.get("advancedHours") == 0), None)
+        if not now or not (now.get("position") or {}).get("deg"):
+            continue
+        lat, lon = now["position"]["deg"][:2]
+        name = (title.get("name") or {}).get("en") or ""
+        kt10 = num(((now.get("maximumWind") or {}).get("sustained") or {}).get("kt"))
+        course = "".join(JMA_COMPASS.get(ch, "?") for ch in str(now.get("course") or ""))
+        move_deg = DIRS16.index(course) * 22.5 if course in DIRS16 else None
+        cat = str((now.get("category") or {}).get("en") or "")
+        out.append({"key": storm_key(name), "name": storm_name(name), "lat": lat, "lon": lon,
+                    "kt": kt10, "move": course if move_deg is not None else "",
+                    "move_deg": move_deg, "move_kt": num((now.get("speed") or {}).get("kt")),
+                    "pressure": num(now.get("pressure")), "extratropical": cat == "LOW",
+                    "updated": parse_time((now.get("validtime") or {}).get("UTC")), "id": f"jma-{tc['tropicalCyclone']}"})
+    return out
+
+
+def fetch_jtwc_final():
+    """Keys of the storms JTWC has issued its final warning for ("Tropical Storm 30W (In-fa) Warning #52 Final")."""
+    text = get(JTWC_RSS_URL).decode("utf-8", "replace")
+    ended = set()
+    for m in re.finditer(r"\(([^)]+)\)\s*Warning\s*#\s*\d+(.{0,200})", text, re.S):
+        if re.search(r"final\s+warning", m.group(2), re.I):
+            ended.add(storm_key(m.group(1)))
+    return ended
 
 
 def eonet_tracks(features):
@@ -266,22 +315,26 @@ def eonet_storms(tracks):
         if hours_ago(updated) > 36:
             continue
         lon, lat = pts[-1]["geometry"]["coordinates"][:2]
-        move = ""
+        move, move_deg, move_kt = "", None, None
         if len(pts) >= 2:
             lon0, lat0 = pts[-2]["geometry"]["coordinates"][:2]
             dt = (updated - parse_time(pts[-2]["properties"]["date"])).total_seconds() / 3600.0
             d = km_between(lat0, lon0, lat, lon)
             if dt > 0 and d > 10:
-                move = compass(bearing(lat0, lon0, lat, lon))
+                move_deg = bearing(lat0, lon0, lat, lon)
+                move = compass(move_deg)
+                move_kt = d / dt / 1.852
         kt = num(last.get("magnitudeValue")) if str(last.get("magnitudeUnit", "")).startswith("kt") else None
         out.append({"key": storm_key(last.get("title", "")), "name": storm_name(last.get("title", "")), "lat": lat, "lon": lon,
-                    "kt": kt, "move": move, "start": parse_time(pts[0]["properties"]["date"]), "updated": updated,
-                    "id": eid})
+                    "kt": kt, "move": move, "move_deg": move_deg, "move_kt": move_kt,
+                    "start": parse_time(pts[0]["properties"]["date"]), "updated": updated, "id": eid})
     return out
 
 
-def cyclones(gdacs, nhc, eon):
-    """Merge the three lists by name, or by position within 300 km. NHC's numbers beat EONET's beat GDACS's peak."""
+def cyclones(gdacs, nhc, eon, jma=(), jtwc_ended=frozenset()):
+    """Merge the lists by name, or by position within 300 km. NHC's numbers beat EONET's beat GDACS's peak; the
+    freshest position wins. Storms JMA calls extratropical are relabelled "Former storm ...". Storms JTWC has finished
+    with that nobody has a fix for in the last 6 h, and any storm whose newest fix is over STALE_HOURS old, are dropped."""
     merged = []
 
     def find(c):
@@ -299,21 +352,47 @@ def cyclones(gdacs, nhc, eon):
             continue
         if c["updated"] and (m["updated"] is None or c["updated"] >= m["updated"]):
             m.update(lat=c["lat"], lon=c["lon"], updated=c["updated"])
-        m.update(kt=c["kt"], move=c["move"] or m.get("move", ""), start=m.get("start") or c["start"])
+        m.update(kt=c["kt"], move=c["move"] or m.get("move", ""), start=m.get("start") or c["start"],
+                 move_deg=c.get("move_deg"), move_kt=c.get("move_kt"))
         m["sources"].append("EONET")
+    for c in jma:
+        m = find(c)
+        if m is None:
+            merged.append(dict(c, alert="", peak_kt=None, start=c["updated"], sources=["JMA"]))
+            continue
+        if c["updated"] and (m["updated"] is None or c["updated"] >= m["updated"]):
+            m.update(lat=c["lat"], lon=c["lon"], updated=c["updated"], move=c["move"] or m.get("move", ""),
+                     move_deg=c["move_deg"], move_kt=c["move_kt"], move_mph=None)
+            if c["kt"] or c["extratropical"]:
+                m["kt"] = c["kt"]
+        m.update(extratropical=c["extratropical"], pressure=c["pressure"])
+        m["sources"].append("JMA")
     for c in nhc:
         m = find(c)
         if m is None:
             merged.append(dict(c, alert="", peak_kt=None, start=c["updated"], sources=["NHC"]))
             continue
         m.update(lat=c["lat"], lon=c["lon"], kt=c["kt"] or m.get("kt"), move=c["move"] or m.get("move", ""),
-                 move_mph=c.get("move_mph"), cls=c["cls"], updated=c["updated"] or m["updated"], name=c["name"])
+                 move_mph=c.get("move_mph"), cls=c["cls"], updated=c["updated"] or m["updated"], name=c["name"],
+                 move_deg=c["move_deg"] if c.get("move_deg") is not None else m.get("move_deg"),
+                 move_kt=c["move_kt"] if c.get("move_kt") is not None else m.get("move_kt"))
         m["sources"].append("NHC")
 
     out = []
     for m in merged:
+        age = hours_ago(m["updated"])
+        if age > STALE_HOURS:
+            log(f"cyclone {m['name']}: newest fix {age:.0f} h old, dropped")
+            continue
+        if m["key"] in jtwc_ended and not m.get("extratropical") and "NHC" not in m["sources"] and age > 6:
+            log(f"cyclone {m['name']}: JTWC final warning and no fresh fix, dropped")
+            continue
         kt = m.get("kt")
-        if kt:
+        if m.get("extratropical"):
+            line = "Extratropical low"
+            if m.get("pressure"):
+                line += f", {m['pressure']:.0f} hPa"
+        elif kt:
             line = f"{category(kt)}, {kt:.0f} kt"
         elif m.get("peak_kt"):
             line = f"{m['alert'] + ' alert, ' if m.get('alert') else ''}peak {m['peak_kt']:.0f} kt"
@@ -321,10 +400,9 @@ def cyclones(gdacs, nhc, eon):
             line = "Tropical cyclone"
         if m.get("move"):
             line += f", moving {m['move']}"
-            if m.get("move_mph"):
-                line += f" {m['move_mph'] * 0.869:.0f} kt"
-        age = hours_ago(m["updated"])
-        if age > 18:
+            if m.get("move_kt"):
+                line += f" {m['move_kt']:.0f} kt"
+        if age > 6:
             line += f", last fix {age:.0f} h ago"
         alert = {"red": 30, "orange": 15}.get(m.get("alert", "").lower(), 0)
         score = 100 + (kt or (m.get("peak_kt") or 40) * 0.6) + alert - max(0.0, age - 12) * 0.8
@@ -335,11 +413,36 @@ def cyclones(gdacs, nhc, eon):
             word = "Typhoon"
         if kt is not None and kt < 64:
             word = "Tropical storm" if kt >= 34 else "Depression"
+        if m.get("extratropical"):
+            word = "Former storm"
         name = f"{word} {m['name']}" if m["name"] else word
         src = "/".join(dict.fromkeys(m["sources"]))
-        out.append(event("cyclone", m["id"], name, line, m["lat"], m["lon"], m.get("start"), m["updated"], src,
-                         score))
+        ev = event("cyclone", m["id"], name, line, m["lat"], m["lon"], m.get("start"), m["updated"], src, score)
+        # No swirl for a storm gone extratropical: its winds and shape no longer fit a tropical vortex.
+        ev.update(storm_fields(None if m.get("extratropical") else kt or m.get("peak_kt"), m["lat"],
+                               m.get("move_deg"), m.get("move_kt")))
+        out.append(ev)
     return out
+
+
+def storm_fields(kt, lat, move_deg, move_kt):
+    """Structured numbers for the sky's cyclone swirl (CycloneSwirl.cs); extra keys, so older readers ignore them.
+
+    wind_kt: max sustained wind. rmw_km: radius of maximum wind, estimated from wind and latitude (Willoughby,
+    Darling and Rahn 2006, eq. 7a; the agencies' feeds don't carry it). radius_km: where the circulation fades out,
+    about the gale radius (Knaff et al.'s climatology puts typical 34 kt radii at 150-300 km; 6 x RMW, clamped).
+    move_deg / move_kt: motion over the last two fixes, so the world can dead-reckon a few hours from the fix.
+    Unknown values are -1.
+    """
+    f = {"wind_kt": -1, "rmw_km": -1, "radius_km": -1, "move_deg": -1, "move_kt": -1}
+    if kt:
+        v = kt * 0.5144
+        rmw = 218.3784 - 1.2014 * v + (v / 10.9884) ** 2 - (v / 35.3052) ** 3 - 145.509 * math.cos(math.radians(lat))
+        rmw = min(max(rmw, 15.0), 120.0)
+        f.update(wind_kt=round(kt), rmw_km=round(rmw), radius_km=round(min(max(rmw * 6.0, 200.0), 600.0)))
+    if move_deg is not None and move_kt is not None:
+        f.update(move_deg=round(move_deg % 360.0), move_kt=round(move_kt, 1))
+    return f
 
 
 # ---------------------------------------------------------------------------------------------- EONET others
@@ -722,7 +825,9 @@ def build(clouds_dir, kinds=SHOWN_KINDS):
     ok["EONET"] = ok_r or ok_s
     tracks = eonet_tracks(recent + standing)
     eon_storms, _ = attempt("EONET storms", eonet_storms, tracks)
-    events, _ = attempt("cyclone merge", cyclones, gd, nh, eon_storms)
+    jm, ok["JMA"] = attempt("JMA", fetch_jma)
+    jt, ok["JTWC"] = attempt("JTWC final warnings", lambda: [fetch_jtwc_final()])
+    events, _ = attempt("cyclone merge", cyclones, gd, nh, eon_storms, jm, jt[0] if jt else frozenset())
     hot = bool(kinds & {"fire", "volcano"})
     others, _ = attempt("EONET events", eonet_others, tracks, not hot)
     if hot:

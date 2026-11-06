@@ -39,8 +39,11 @@ def keys(prefix):
         return sorted(re.findall(r"<Key>([^<]+\.nc)</Key>", r.read().decode()))
 
 
-def fetch(folder):
-    """Downloads the newest hourly file and the same hour on each of the previous days. Returns (now, past, hour)."""
+def fetch(folder, with_vis=False):
+    """Downloads the newest hourly infrared (and, if asked, visible) files and the same hour on each of the previous days.
+
+    Returns (ir_now, ir_past, vis_now, vis_past, hour); vis_now is None if the visible mosaic is missing.
+    """
     t = datetime.datetime.now(datetime.timezone.utc)
     for _ in range(6):   # the newest hour appears about 40 minutes after it ends
         found = keys(t.strftime("GMGSI_LW/%Y/%m/%d/%H/"))
@@ -49,16 +52,19 @@ def fetch(folder):
         t -= datetime.timedelta(hours=1)
     else:
         raise SystemExit("no GMGSI file in the last 6 hours")
-    paths = []
+    paths = {"LW": [], "VIS": []} if with_vis else {"LW": []}
     for day in range(PAST_DAYS + 1):
-        k = found if day == 0 else keys((t - datetime.timedelta(days=day)).strftime("GMGSI_LW/%Y/%m/%d/%H/"))
-        if not k:
-            continue
-        path = os.path.join(folder, f"{day}.nc")
-        urllib.request.urlretrieve(f"{BUCKET}/{k[-1]}", path)
-        paths.append(path)
-    print(f"{t:%Y-%m-%d %H}:00 UTC with {len(paths) - 1} past days")
-    return paths[0], paths[1:], t
+        for product in paths:
+            k = keys((t - datetime.timedelta(days=day)).strftime(f"GMGSI_{product}/%Y/%m/%d/%H/"))
+            if not k:
+                continue
+            path = os.path.join(folder, f"{product}_{day}.nc")
+            urllib.request.urlretrieve(f"{BUCKET}/{k[-1]}", path)
+            paths[product].append((day, path))
+    ir = dict(paths["LW"])
+    vis = dict(paths.get("VIS", []))
+    print(f"{t:%Y-%m-%d %H}:00 UTC with {len(ir) - 1} past infrared days, {len(vis)} visible files")
+    return ir[0], [p for d, p in sorted(ir.items()) if d], vis.get(0), [p for d, p in sorted(vis.items()) if d], t
 
 
 def load(path):
@@ -91,6 +97,61 @@ def clouds(now, past):
     op = np.maximum(smoothstep(6.0, 45.0, rise), smoothstep(150.0, 205.0, now))
     top = np.clip(np.maximum(rise, (now - 70.0) * 0.8) / COUNTS_PER_KM, 0.5, TOP_KM)
     return np.nan_to_num(op, nan=0.0), np.nan_to_num(top, nan=0.5)
+
+
+def sun_cos(lat, lon, t):
+    """Cosine of the Sun's zenith angle over the grid at UTC time t (declination and hour angle; no equation of time)."""
+    day = t.timetuple().tm_yday
+    decl = np.radians(-23.44) * np.cos(2.0 * np.pi * (day + 10) / 365.0)
+    hour_angle = np.radians((t.hour + t.minute / 60.0 - 12.0) * 15.0 + lon)[None, :]
+    la = np.radians(lat)[:, None]
+    return np.sin(la) * np.sin(decl) + np.cos(la) * np.cos(decl) * np.cos(hour_angle)
+
+
+def clouds_vis(vis, vis_past, cosz):
+    """Opacity from the visible mosaic, which sees cloud as a camera does: by how much brighter than clear sky it is.
+
+    Clear sky is the darkest value seen at this hour over the previous days: the Sun stands at the same angle each
+    day, so the ocean glint, deserts and snow are in that baseline and cancel out. Returns (opacity, valid), with
+    valid false on the night side and where no visible data exists.
+    """
+    stack = []
+    for v in vis_past + [vis]:
+        v = v.copy()
+        v[v <= 0.0] = np.nan
+        stack.append(v)
+    clear = np.nanmin(np.stack(stack), axis=0)
+    rise = (stack[-1] - clear) / np.maximum(cosz, 0.15)
+    # Compared against true-colour imagery: a solid low deck rises about 60 counts over the ocean, a thick storm top
+    # about 150.
+    op = smoothstep(12.0, 110.0, rise)
+    valid = np.isfinite(rise) & (cosz > 0.1)
+    return np.nan_to_num(op, nan=0.0), valid
+
+
+def blend(op_ir, top, op_vis, valid, cosz):
+    """Visible opacity where the Sun is up, infrared elsewhere, with the infrared calibrated against the visible
+    where both exist (per cloud-top height band) so the night side matches the day side."""
+    overlap = valid & (cosz > 0.35)
+    edges = [0.0, 3.0, 6.0, 9.0, 12.0, 17.0]
+    centres, scales = [], []
+    for a, b in zip(edges[:-1], edges[1:]):
+        m = overlap & (top >= a) & (top < b) & ((op_ir > 0.05) | (op_vis > 0.05))
+        if m.sum() < 2000:
+            continue
+        centres.append(0.5 * (a + b))
+        scales.append(float(np.clip(op_vis[m].mean() / max(op_ir[m].mean(), 1e-3), 0.3, 1.5)))
+    if centres:
+        scale = np.interp(top, centres, scales)
+        print("infrared opacity scaled to visible by top band: " + ", ".join(f"{c:.1f} km x{s:.2f}" for c, s in zip(centres, scales)))
+    else:
+        scale = 1.0
+    op_night = np.clip(op_ir * scale, 0.0, 1.0)
+    w = smoothstep(0.12, 0.35, cosz) * valid
+    op = op_night * (1.0 - w) + op_vis * w
+    # Warm low cloud (fog, stratus) is invisible to infrared but plain in daylight: give it a low top.
+    top = np.where(w * op_vis > op_night + 0.2, np.maximum(top, 1.5), top)
+    return op, top
 
 
 def deseam(op, top):
@@ -133,12 +194,13 @@ def to_equirect(op, lat, lon):
     rows = H
     out_lat = 90.0 - (np.arange(rows) + 0.5) * 180.0 / rows
     out_lon = -180.0 + (np.arange(W) + 0.5) * 360.0 / W
-    # Source rows run north to south at a fixed step; source columns start at 180 and wrap round.
-    dlat = (lat[0] - lat[-1]) / (len(lat) - 1)
+    # Source rows run north to south on a Mercator grid: the step is 0.072 degrees at the equator and 0.021 near
+    # 72 N. Treating it as even put every cloud too close to the equator (a storm at 47 N drew at 36 N), so each
+    # output row is looked up in the source's own latitudes. Source columns are even, start at 180 and wrap round.
     dlon = 360.0 / len(lon)
-    fy = (lat[0] - out_lat) / dlat
+    fy = np.interp(out_lat, lat[::-1], np.arange(len(lat), dtype=np.float64)[::-1])
     fx = ((out_lon - lon[0]) % 360.0) / dlon
-    inside = (fy >= 0) & (fy <= len(lat) - 1)
+    inside = (out_lat <= lat[0]) & (out_lat >= lat[-1])
     y0 = np.clip(np.floor(fy).astype(int), 0, len(lat) - 2)
     ty = np.clip(fy - y0, 0, 1)[:, None]
     x0 = np.floor(fx).astype(int) % len(lon)
@@ -156,16 +218,27 @@ def main():
     p.add_argument("now", nargs="?")
     p.add_argument("--fetch", action="store_true", help="download the inputs from NOAA")
     p.add_argument("--past", nargs="*", default=[])
+    p.add_argument("--vis", help="visible mosaic for the same hour")
+    p.add_argument("--vis-past", nargs="*", default=[])
+    p.add_argument("--vis-blend", action="store_true",
+                   help="experimental: with --fetch, also download the visible mosaics and blend them in by day")
+    p.add_argument("--time", help="UTC hour of the data as YYYY-MM-DDTHH, for the Sun's position (default: now)")
     p.add_argument("--out", default=".")
     p.add_argument("--preview", action="store_true", help="also write full.png, the whole 4096 x 2048 map")
     a = p.parse_args()
     tmp = tempfile.TemporaryDirectory()
     hour = None
     if a.fetch:
-        a.now, a.past, hour = fetch(tmp.name)
+        a.now, a.past, a.vis, a.vis_past, hour = fetch(tmp.name, a.vis_blend)
     now, lat, lon = load(a.now)
     past = [load(f)[0] for f in a.past]
     op, top = clouds(now, past)
+    if a.vis:
+        t = hour or (datetime.datetime.strptime(a.time, "%Y-%m-%dT%H").replace(tzinfo=datetime.timezone.utc) if a.time
+                     else datetime.datetime.now(datetime.timezone.utc))
+        cosz = sun_cos(lat, ((lon + 180.0) % 360.0) - 180.0, t)
+        op_vis, valid = clouds_vis(load(a.vis)[0], [load(f)[0] for f in a.vis_past], cosz)
+        op, top = blend(op, top, op_vis, valid, cosz)
     op, top = deseam(op, top)
     # Cover is nearly all-or-nothing from one source pixel to the next, so an edge falls inside a single pixel and the
     # sky shader's threshold traces the pixel staircase (right angles). A slight blur spreads each edge over a few
