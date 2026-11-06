@@ -24,6 +24,9 @@ jobs:
           python-version: "3.12"
       - run: pip install h5py numpy pillow scipy
       - run: python live_clouds.py --fetch --out site
+      # GFS forecast clouds and steering winds for the observatory (forecast.png, winds.png, forecast.json). Never
+      # lets a forecast failure stop the clouds.
+      - run: python forecast_layers.py --out site || true
       # Never lets a broken events source stop the clouds.
       - run: python events_feed.py --out site --clouds-dir site || true
       - name: Publish
