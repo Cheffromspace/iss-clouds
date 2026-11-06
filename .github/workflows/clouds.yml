@@ -1,7 +1,7 @@
 # Publishes the ISS world's live cloud images to GitHub Pages every hour.
 # This lives in its own small public repo (Pages has to be public, and *.github.io is on VRChat's trusted image
 # list). The source of truth for the converter is tools/live_clouds.py in the nasa-3d-vr repo; copy it here when it
-# changes. The site is the gh-pages branch, replaced on every run so it never grows. The push also counts as
+# changes; the same goes for events_feed.py (the observatory world's "Now" list, events.json). The site is the gh-pages branch, replaced on every run so it never grows. The push also counts as
 # repository activity, which stops GitHub pausing the schedule after 60 quiet days.
 name: clouds
 on:
@@ -24,6 +24,8 @@ jobs:
           python-version: "3.12"
       - run: pip install h5py numpy pillow scipy
       - run: python live_clouds.py --fetch --out site
+      # Never lets a broken events source stop the clouds.
+      - run: python events_feed.py --out site --clouds-dir site || true
       - name: Publish
         run: |
           cd site
