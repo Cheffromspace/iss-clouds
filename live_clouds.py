@@ -42,7 +42,7 @@ def keys(prefix):
 def fetch(folder, with_vis=False):
     """Downloads the newest hourly infrared (and, if asked, visible) files and the same hour on each of the previous days.
 
-    Returns (ir_now, ir_past, vis_now, vis_past, hour); vis_now is None if the visible mosaic is missing.
+    Returns (ir_now, ir_past, vis_now, vis_past, hour, ir_prev_hour); vis_now and ir_prev_hour are None if missing.
     """
     t = datetime.datetime.now(datetime.timezone.utc)
     for _ in range(6):   # the newest hour appears about 40 minutes after it ends
@@ -61,10 +61,16 @@ def fetch(folder, with_vis=False):
             path = os.path.join(folder, f"{product}_{day}.nc")
             urllib.request.urlretrieve(f"{BUCKET}/{k[-1]}", path)
             paths[product].append((day, path))
+    # The hour before, for cloud motion (flow.png).
+    k = keys((t - datetime.timedelta(hours=1)).strftime("GMGSI_LW/%Y/%m/%d/%H/"))
+    prev = None
+    if k:
+        prev = os.path.join(folder, "LW_prev.nc")
+        urllib.request.urlretrieve(f"{BUCKET}/{k[-1]}", prev)
     ir = dict(paths["LW"])
     vis = dict(paths.get("VIS", []))
     print(f"{t:%Y-%m-%d %H}:00 UTC with {len(ir) - 1} past infrared days, {len(vis)} visible files")
-    return ir[0], [p for d, p in sorted(ir.items()) if d], vis.get(0), [p for d, p in sorted(vis.items()) if d], t
+    return ir[0], [p for d, p in sorted(ir.items()) if d], vis.get(0), [p for d, p in sorted(vis.items()) if d], t, prev
 
 
 def load(path):
@@ -213,6 +219,110 @@ def to_equirect(op, lat, lon):
     return img
 
 
+FLOW_W, FLOW_H = 512, 256
+FLOW_KMH = 150.0   # the speed stored as 0 or 1 (0.5 is still); jet-level cloud rarely moves faster
+
+
+def cloud_flow(now_raw, prev_raw, now_op, lat, lon):
+    """How the clouds moved over the last hour, in km/h east and north, on a FLOW_W x FLOW_H equirectangular grid.
+
+    Block matching, the way weather services track cloud motion: on a 2048 x 1024 map of infrared brightness (about
+    20 km a pixel), each patch of this hour is compared with the last hour's shifted by every offset up to about 150
+    km, and the best match wins (refined to a fraction of a pixel). Clear sky has nothing to track, so the result is
+    weighted by cloud and texture and spread smoothly into the gaps.
+    """
+    w2, h2 = 2048, 1024
+
+    def eq(f):
+        img = to_equirect(np.nan_to_num(f, nan=0.0), lat, lon)
+        return img.reshape(h2, H // h2, w2, W // w2).mean(axis=(1, 3))
+
+    a, b, cloud = eq(now_raw), eq(prev_raw), eq(now_op)
+    wrap = ("nearest", "wrap")
+    # Keep the cloud texture, drop the slow changes (the day heating the ground, a deck thickening).
+    a = a - ndimage.gaussian_filter(a, 12, mode=wrap)
+    b = b - ndimage.gaussian_filter(b, 12, mode=wrap)
+    R, block = 7, 11   # search radius and patch size, pixels
+    n = (2 * R + 1) ** 2
+    costs = np.empty((n,) + a.shape, np.float32)
+    offs = []
+    for dy in range(-R, R + 1):
+        for dx in range(-R, R + 1):
+            # The last hour's cloud at (x - dx, y - dy) moved here: compare with the previous image shifted by (dx, dy).
+            sh = np.roll(np.roll(b, dy, axis=0), dx, axis=1)
+            costs[len(offs)] = ndimage.uniform_filter((a - sh) ** 2, block, mode=wrap)
+            offs.append((dx, dy))
+    offs = np.array(offs)
+    k = np.argmin(costs, axis=0)
+    best = np.take_along_axis(costs, k[None], 0)[0]
+    bx, by = offs[k, 0].astype(np.float32), offs[k, 1].astype(np.float32)
+
+    # Sub-pixel: a parabola through the best cost and its neighbours each way (when they're inside the search).
+    def cost(ox, oy):
+        nx, ny = offs[k, 0] + ox, offs[k, 1] + oy
+        ok = (np.abs(nx) <= R) & (np.abs(ny) <= R)
+        idx = np.clip((ny + R) * (2 * R + 1) + (nx + R), 0, n - 1)
+        return np.where(ok, np.take_along_axis(costs, idx[None], 0)[0], np.nan)
+
+    def refine(base, minus, plus):
+        den = minus - 2.0 * best + plus
+        step = np.where(np.isfinite(den) & (den > 1e-6), 0.5 * (minus - plus) / np.where(den > 1e-6, den, 1.0), 0.0)
+        return base + np.clip(step, -0.5, 0.5)
+
+    fx = refine(bx, cost(-1, 0), cost(1, 0))
+    fy = refine(by, cost(0, -1), cost(0, 1))
+    # A clear winner: the best is well below the typical cost at this pixel.
+    typical = np.median(costs[:: max(1, n // 25)], axis=0)
+    del costs
+    distinct = np.clip(1.0 - best / np.maximum(typical, 1e-6), 0.0, 1.0)
+    texture = ndimage.uniform_filter(a * a, block, mode=wrap)
+    inside = (np.abs(bx) < R) & (np.abs(by) < R)
+    wgt = smoothstep(0.2, 0.6, cloud) * smoothstep(4.0, 40.0, texture) * smoothstep(0.2, 0.6, distinct) * inside
+    out_lat = 90.0 - (np.arange(h2) + 0.5) * 180.0 / h2
+    km_x = 2.0 * np.pi * 6371.0 / w2 * np.cos(np.radians(out_lat))[:, None]
+    km_y = np.pi * 6371.0 / h2
+    u = fx * km_x   # km/h east (one hour between the images)
+    v = -fy * km_y  # rows run south, so a positive row shift is southward
+    # A few bad matches survive; the median of the neighbourhood throws them out before smoothing.
+    u = ndimage.median_filter(u, 5, mode="wrap")
+    v = ndimage.median_filter(v, 5, mode="wrap")
+
+    # Spread into the gaps: normalised smoothing at about 150 km, and a much wider pass for big clear areas.
+    def spread(f, sigma):
+        num = ndimage.gaussian_filter(f * wgt, sigma, mode=wrap)
+        den = ndimage.gaussian_filter(wgt, sigma, mode=wrap)
+        return num / np.maximum(den, 1e-6), den
+
+    nu, d1 = spread(u, 7)
+    nv, _ = spread(v, 7)
+    wu, d2 = spread(u, 40)
+    wv, _ = spread(v, 40)
+    near = smoothstep(0.02, 0.15, d1)
+    far = smoothstep(0.0005, 0.01, d2)
+    u = (nu * near + wu * (1 - near)) * far
+    v = (nv * near + wv * (1 - near)) * far
+    # Beyond the satellites' view nothing is known: still.
+    edge = smoothstep(72.0, 62.0, np.abs(out_lat))[:, None]
+    u, v = u * edge, v * edge
+
+    def shrink(f):
+        return f.reshape(FLOW_H, h2 // FLOW_H, FLOW_W, w2 // FLOW_W).mean(axis=(1, 3))
+
+    u, v = shrink(u), shrink(v)
+    speed = np.hypot(u, v)
+    mid = np.abs(90.0 - (np.arange(FLOW_H) + 0.5) * 180.0 / FLOW_H) < 60
+    print(f"cloud motion: median {np.median(speed[mid]):.0f} km/h, 95th percentile {np.percentile(speed[mid], 95):.0f} km/h")
+    return u, v
+
+
+def save_flow(u, v, path):
+    px = np.zeros((FLOW_H, FLOW_W, 3), np.uint8)
+    px[..., 0] = (np.clip(u / (2.0 * FLOW_KMH) + 0.5, 0, 1) * 255 + 0.5).astype(np.uint8)
+    px[..., 1] = (np.clip(v / (2.0 * FLOW_KMH) + 0.5, 0, 1) * 255 + 0.5).astype(np.uint8)
+    px[..., 2] = 128   # the same sRGB marker as the cloud images
+    Image.fromarray(px).save(path, optimize=True)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("now", nargs="?")
@@ -223,13 +333,14 @@ def main():
     p.add_argument("--vis-blend", action="store_true",
                    help="experimental: with --fetch, also download the visible mosaics and blend them in by day")
     p.add_argument("--time", help="UTC hour of the data as YYYY-MM-DDTHH, for the Sun's position (default: now)")
+    p.add_argument("--prev", help="infrared mosaic for the hour before, for cloud motion (flow.png)")
     p.add_argument("--out", default=".")
     p.add_argument("--preview", action="store_true", help="also write full.png, the whole 4096 x 2048 map")
     a = p.parse_args()
     tmp = tempfile.TemporaryDirectory()
     hour = None
     if a.fetch:
-        a.now, a.past, a.vis, a.vis_past, hour = fetch(tmp.name, a.vis_blend)
+        a.now, a.past, a.vis, a.vis_past, hour, a.prev = fetch(tmp.name, a.vis_blend)
     now, lat, lon = load(a.now)
     past = [load(f)[0] for f in a.past]
     op, top = clouds(now, past)
@@ -240,6 +351,12 @@ def main():
         op_vis, valid = clouds_vis(load(a.vis)[0], [load(f)[0] for f in a.vis_past], cosz)
         op, top = blend(op, top, op_vis, valid, cosz)
     op, top = deseam(op, top)
+    flow = None
+    if a.prev:
+        try:
+            flow = cloud_flow(now, load(a.prev)[0], op, lat, lon)
+        except Exception as e:   # motion is a nicety: never lose the clouds over it
+            print(f"cloud motion skipped: {e}")
     # Cover is nearly all-or-nothing from one source pixel to the next, so an edge falls inside a single pixel and the
     # sky shader's threshold traces the pixel staircase (right angles). A slight blur spreads each edge over a few
     # pixels, so the shader's noise shapes it instead of the grid.
@@ -261,6 +378,8 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     Image.fromarray(px[:, : W // 2]).save(os.path.join(a.out, "west.png"), optimize=True)
     Image.fromarray(px[:, W // 2 :]).save(os.path.join(a.out, "east.png"), optimize=True)
+    if flow is not None:
+        save_flow(*flow, os.path.join(a.out, "flow.png"))
     if a.preview:
         Image.fromarray(px).save(os.path.join(a.out, "full.png"))
     if hour is not None:
