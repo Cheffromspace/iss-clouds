@@ -10,8 +10,10 @@ Sources (all free, no key):
   NHC CurrentStorms.json, detail for Atlantic and east/central Pacific storms
   NASA EONET v3: wildfires, volcanoes, sea ice (icebergs), dust/haze, and storms GDACS doesn't list yet
   USGS M4.5+ past day: M6+ or significant only
-  NOAA SWPC planetary Kp: aurora when Kp >= 5
+  NOAA SWPC planetary Kp and OVATION nowcast: the "aurora" block the sky draws every hour, and an event when Kp >= 5
   Our own cold-top finder on the published cloud maps (red = opacity, green = cloud-top height 0-16 km)
+  With fire or volcano kinds (fire_volcano.py, kept next to this file): NASA FIRMS VIIRS fires (24 h), AWC volcanic
+  ash SIGMETs, Smithsonian GVP summits. See hot_events() for the fields they add.
 
 Any source that fails is skipped with a note on stderr; the file is always written. The output is kept small and
 flat for Udon's VRCJson parser: one list of flat objects, plain numbers, ASCII strings, under 16 KB.
@@ -46,6 +48,7 @@ EONET_RECENT_URL = ("https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=op
 EONET_STANDING_URL = "https://eonet.gsfc.nasa.gov/api/v3/events/geojson?status=open&category=volcanoes,seaLakeIce"
 USGS_URL = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson"
 KP_URL = "https://services.swpc.noaa.gov/products/noaa-planetary-k-index.json"
+OVATION_URL = "https://services.swpc.noaa.gov/json/ovation_aurora_latest.json"
 CLOUDS_URL = "https://cheffromspace.github.io/iss-clouds/"
 
 CREDITS = {
@@ -55,16 +58,19 @@ CREDITS = {
     "USGS": "USGS Earthquake Hazards Program",
     "SWPC": "NOAA Space Weather Prediction Center",
     "GMGSI": "NOAA GMGSI infrared mosaic (cold-top finder)",
+    "FIRMS": "NASA FIRMS (VIIRS 375 m)",
+    "AWC": "NOAA Aviation Weather Center / VAACs",
+    "GVP": "Smithsonian GVP, Volcanoes of the World",
 }
 
 # Viewing altitudes, matching the console's presets (10, 35, 100, 400, 1000, 5000, 36000 km).
 ALT = {"cyclone": 1000, "storm": 400, "fire": 35, "volcano": 35, "ice": 100, "quake": 400, "aurora": 400,
        "dust": 1000}
 
-# Kinds the observatory can show today: storms appear in its live cloud maps. Fires, smoke, dust, volcanoes, sea
-# ice, quakes and aurora have no visuals yet (owner, 2026-11-05: list only what the world can show), so they're
-# left out unless asked for with --kinds.
-SHOWN_KINDS = ("cyclone", "storm")
+# Kinds the observatory can show today: storms appear in its live cloud maps, and the sky draws the aurora oval
+# from the "aurora" block below. Fires, smoke, dust, volcanoes, sea ice and quakes have no visuals yet (owner,
+# 2026-11-05: list only what the world can show), so they're left out unless asked for with --kinds.
+SHOWN_KINDS = ("cyclone", "storm", "aurora")
 ALL_KINDS = tuple(ALT)
 
 STANDING = [
@@ -341,7 +347,7 @@ def cyclones(gdacs, nhc, eon):
 PRESCRIBED = re.compile(r"prescrib|\bRX\b|\bPB\b|\bBB\b|\bCPT\b|pile|burn block|slash", re.I)
 
 
-def eonet_others(tracks):
+def eonet_others(tracks, limit=True):
     fires, volcs, ice, dust = [], [], [], []
     for eid, pts in tracks.items():
         cat = category_of(pts[0])
@@ -379,7 +385,105 @@ def eonet_others(tracks):
     fires.sort(key=lambda e: -e["_score"])
     volcs.sort(key=lambda e: -e["_score"])
     ice.sort(key=lambda e: -e["_score"])
+    if not limit:                                   # hot_events() checks them all first, then trims
+        return fires + volcs + ice[:2] + dust[:3]
     return fires[:10] + volcs[:3] + ice[:2] + dust[:3]
+
+
+# ---------------------------------------------------------------------------------------------- fire, volcano detail
+
+FIRE_MATCH_KM = 25.0      # an EONET fire's point to the edge of a FIRMS fire cluster
+VOLC_MATCH_KM = 20.0      # an EONET volcano's point to an ash SIGMET's vent
+
+
+def hot_events(others, kinds, ok):
+    """Checks fires and volcanoes against what satellites and aviation see now, and adds what the sky needs to draw
+    them. Only things really happening stay (owner, 2026-11-05): a fire must have VIIRS detections in the last 24 h,
+    a volcano an ash SIGMET in force or a hot vent; when the checking source fails, the EONET entry stays as is.
+
+    Fire fields: frp_mw (fire radiative power summed over the 24 h of VIIRS passes, MW), night_mw (the night passes'
+      part, which is what glows), fire_km (radius of the burning area), seen (newest detection, ISO time).
+      Big fire clusters EONET doesn't list (over 1,000 MW from 10+ pixels) are added as their own events.
+    Volcano fields: summit_km (GVP), glow_mw (night FRP at the vent, 5 MW or more over 24 h; 0 = no glow seen),
+      plume_top_km (ash cloud top above sea level), plume_dir (degrees, the way the ash extends from the vent),
+      plume_km (vent to the far end of the observed ash), plume_kt (forecast drift speed). -1 = no ash reported.
+    """
+    import fire_volcano as fv
+    fires = [e for e in others if e["kind"] == "fire"]
+    volcs = [e for e in others if e["kind"] == "volcano"]
+    rest = [e for e in others if e["kind"] not in ("fire", "volcano")]
+    det, ok["FIRMS"] = attempt("FIRMS VIIRS 24 h", fv.firms)
+    clusters = fv.fire_clusters(det) if ok["FIRMS"] else []
+    plumes, gvp = {}, {}
+    if "volcano" in kinds:
+        plumes, ok["AWC"] = attempt("AWC ash SIGMETs", fv.ash_plumes, NOW)
+        gvp, ok["GVP"] = attempt("GVP volcanoes", fv.gvp_volcanoes)
+
+    out_v, used_plumes = [], set()
+    for e in volcs:
+        plume = None
+        for k, p in plumes.items():
+            if k not in used_plumes and p["vent"] and km_between(e["lat"], e["lon"], *p["vent"]) < VOLC_MATCH_KM:
+                plume = p
+                used_plumes.add(k)
+                break
+        hot = fv.vent_heat(clusters, e["lat"], e["lon"]) if clusters else None
+        if not plume and not hot and ok["FIRMS"] and ok.get("AWC"):
+            continue                                      # listed, but nothing to see today
+        g = next((v for v in gvp.values() if km_between(e["lat"], e["lon"], v[1], v[2]) < 5), None)
+        e.update(fv.volcano_fields(plume, hot, g[3] if g else 0.0))
+        e["line"] = ascii_text(fv.volcano_line(plume, hot), 60)
+        e["source"] = "/".join(["EONET"] + (["AWC"] if plume else []) + (["FIRMS"] if hot else []) +
+                               (["GVP"] if g else []))
+        e["_score"] = 45 + (plume["top_km"] * 2 if plume else 0) + (math.log10(1 + hot["frp_mw"]) * 3 if hot else 0)
+        out_v.append(e)
+    for k, p in plumes.items():                           # erupting now but not (yet) in EONET
+        if k in used_plumes:
+            continue
+        g = gvp.get(k)
+        lat, lon = (g[1], g[2]) if g else (p["vent"] or (None, None))
+        if lat is None:
+            continue
+        hot = fv.vent_heat(clusters, lat, lon) if clusters else None
+        e = event("volcano", f"va-{k.lower()}", g[0] if g else p["name"], fv.volcano_line(p, hot), lat, lon,
+                  p["obs"], p["obs"], "/".join(["AWC"] + (["FIRMS"] if hot else []) + (["GVP"] if g else [])),
+                  45 + p["top_km"] * 2)
+        e.update(fv.volcano_fields(p, hot, g[3] if g else 0.0))
+        out_v.append(e)
+
+    def fire_fields(c):
+        return {"frp_mw": round(c["frp_mw"]), "night_mw": round(c["night_mw"]), "fire_km": round(c["radius_km"], 1),
+                "seen": iso(c["last"])}
+
+    vents = [(e["lat"], e["lon"]) for e in out_v]
+    out_f, taken = [], set()
+    for e in fires:
+        c = fv.nearest_cluster(clusters, e["lat"], e["lon"], FIRE_MATCH_KM) if clusters else None
+        if c is None and ok["FIRMS"]:
+            continue                                      # no VIIRS detection in 24 h: out, or too small to see
+        if c:
+            taken.add(id(c))
+            e.update(fire_fields(c))
+            e["source"] = "EONET/FIRMS"
+            e["_score"] += math.log10(1 + c["frp_mw"]) * 3
+        out_f.append(e)
+    for c in clusters:
+        if c["frp_mw"] < fv.MIN_FIRE_MW:
+            break
+        if id(c) in taken or c["pixels"] < fv.MIN_FIRE_PIXELS:
+            continue
+        if any(km_between(c["lat"], c["lon"], a, b) < c["radius_km"] + fv.VENT_KM for a, b in vents):
+            continue                                      # a volcano's own heat
+        line = f"{c['frp_mw']:,.0f} MW of fire in 24 h, {2 * c['radius_km']:.0f} km across"
+        e = event("fire", f"firms-{c['lat']:+.1f}{c['lon']:+.1f}", f"Fires {latlon_text(c['lat'], c['lon'])}", line,
+                  c["lat"], c["lon"], c["last"], c["last"], "FIRMS", 28 + math.log10(c["frp_mw"]) * 3)
+        e.update(fire_fields(c))
+        out_f.append(e)
+    out_f.sort(key=lambda e: -e["_score"])
+    out_v.sort(key=lambda e: -e["_score"])
+    log(f"fires: {len(fires)} from EONET, {len(out_f)} kept or added; volcanoes: {len(volcs)} from EONET, "
+        f"{len(plumes)} ash SIGMETs, {len(out_v)} kept")
+    return out_f[:10] + out_v[:5] + rest
 
 
 # ---------------------------------------------------------------------------------------------- quakes, aurora
@@ -416,7 +520,7 @@ def geomag_lat(lat, lon):
                                   math.cos(a) * math.cos(b) * math.cos(math.radians(lon - DIPOLE_LON))))
 
 
-def aurora():
+def kp_rows():
     data = get_json(KP_URL)
     rows = []
     for r in data:
@@ -434,14 +538,73 @@ def aurora():
     if not rows:
         raise ValueError("no Kp rows")
     rows.sort()
+    return rows
+
+
+def kp_band(kp):
+    """Night-side oval from Kp alone, in degrees geomagnetic latitude: (equatorward edge, poleward edge).
+    The same formula as the world's fallback (AuroraFeed.cs), so the two agree."""
+    return 66.0 - 2.0 * kp, 73.0 - 0.9 * kp
+
+
+def ovation_bands():
+    """Summarise SWPC's OVATION nowcast (a 1-degree grid of aurora probability, about 920 KB) to what the world
+    draws: per hemisphere, the night-side (21-03 magnetic local time) oval's equatorward and poleward edges in
+    geomagnetic latitude where the probability is at least 10 %, and its peak probability."""
+    data = get_json(OVATION_URL)
+    g = np.asarray(data["coordinates"], dtype=float)
+    lon, lat, p = np.radians(g[:, 0]), np.radians(g[:, 1]), g[:, 2]
+    # Geographic -> dipole frame: z along the geomagnetic north pole, x toward its meridian.
+    b, l0 = math.radians(DIPOLE_LAT), math.radians(DIPOLE_LON)
+    x, y, z = np.cos(lat) * np.cos(lon - l0), np.cos(lat) * np.sin(lon - l0), np.sin(lat)
+    mx, mz = x * math.sin(b) - z * math.cos(b), x * math.cos(b) + z * math.sin(b)
+    mlat, mlon = np.degrees(np.arcsin(np.clip(mz, -1, 1))), np.degrees(np.arctan2(y, mx))
+    # Magnetic local time from the subsolar point's magnetic longitude (declination and equation of time ignored:
+    # an hour of MLT is 15 degrees, far coarser than either).
+    t = parse_time(data.get("Forecast Time")) or parse_time(data.get("Observation Time")) or NOW
+    slon = math.radians(180.0 - (t.hour + t.minute / 60.0) * 15.0) - l0
+    smlon = math.degrees(math.atan2(math.sin(slon), math.cos(slon) * math.sin(b)))
+    mlt = (12.0 + (mlon - smlon) / 15.0) % 24.0
+    night = (mlt >= 21.0) | (mlt <= 3.0)
+    out = {}
+    for hemi, sign in (("n", 1.0), ("s", -1.0)):
+        m = night & (sign * mlat > 40.0)
+        seen = m & (p >= 10.0)
+        if seen.sum() < 5:
+            out[hemi] = None                                   # nothing visible on that night side
+            continue
+        a = sign * mlat[seen]
+        out[hemi] = (float(np.percentile(a, 5)), float(np.percentile(a, 95)), float(p[m].max()))
+    return out, t
+
+
+def aurora_state(rows, ov):
+    """The world's aurora settings: Kp, the time they're for, the night-side oval per hemisphere and its strength.
+    Published every hour whatever Kp is, because a quiet oval is still real (faint, near the poles)."""
+    kp_now = rows[-1][1]
+    eq, pol = kp_band(kp_now)
+    st = {"kp": round(kp_now, 2), "kp_time": iso(rows[-1][0]), "unix": int(NOW.timestamp()),
+          "n_eq": round(eq, 1), "n_pol": round(pol, 1), "s_eq": round(eq, 1), "s_pol": round(pol, 1),
+          "n_peak": -1, "s_peak": -1, "source": "kp"}
+    if ov:
+        bands, t = ov
+        st["source"], st["unix"] = "ovation", int(t.timestamp())
+        for h in ("n", "s"):
+            if bands[h] is None:
+                st[h + "_peak"] = 0
+            else:
+                st[h + "_eq"], st[h + "_pol"], st[h + "_peak"] = round(bands[h][0], 1), round(bands[h][1], 1),                     int(round(bands[h][2]))
+    return st
+
+
+def aurora(rows):
     recent = [kp for t, kp in rows if hours_ago(t) <= 6] or [rows[-1][1]]
     kp = max(recent)
     log(f"Kp now {rows[-1][1]:.2f} ({rows[-1][0]:%Y-%m-%d %H}Z), max {kp:.2f} in the last 6 h")
     if kp < 5:
         return []
-    # Rough equatorward edge of the auroral oval: about 66 - 2 Kp degrees geomagnetic latitude on the night side
-    # (Kp 5 about 56, Kp 9 about 48).
-    edge = 66.0 - 2.0 * kp
+    # Equatorward edge of the auroral oval on the night side (kp_band: Kp 5 about 56, Kp 9 about 48).
+    edge = kp_band(kp)[0]
     # Go to the northern oval at local midnight, a few degrees poleward of the edge.
     lon = ((180.0 - (NOW.hour + NOW.minute / 60.0) * 15.0 + 180.0) % 360.0) - 180.0
     lat = next((la for la in np.arange(30.0, 89.0, 0.25) if geomag_lat(la, lon) >= edge + 4.0), 65.0)
@@ -560,12 +723,19 @@ def build(clouds_dir, kinds=SHOWN_KINDS):
     tracks = eonet_tracks(recent + standing)
     eon_storms, _ = attempt("EONET storms", eonet_storms, tracks)
     events, _ = attempt("cyclone merge", cyclones, gd, nh, eon_storms)
-    others, _ = attempt("EONET events", eonet_others, tracks)
+    hot = bool(kinds & {"fire", "volcano"})
+    others, _ = attempt("EONET events", eonet_others, tracks, not hot)
+    if hot:
+        others = hot_events(others, kinds, ok)
     qk, au = [], []
     if "quake" in kinds:
         qk, ok["USGS"] = attempt("USGS", quakes)
-    if "aurora" in kinds:
-        au, ok["SWPC"] = attempt("SWPC Kp", aurora)
+    # Kp and the OVATION oval are published whatever the kinds: the world draws the aurora from them all the time.
+    rows, ok["SWPC"] = attempt("SWPC Kp", kp_rows)
+    ov, ok_ov = attempt("SWPC OVATION", lambda: [ovation_bands()])
+    aurora_doc = aurora_state(rows, ov[0] if ok_ov else None) if rows else None
+    if "aurora" in kinds and rows:
+        au, _ = attempt("aurora event", aurora, rows)
     rg, ok["GMGSI"] = attempt("cloud maps", lambda: load_clouds(clouds_dir))
     ct = []
     if ok["GMGSI"] and len(rg):
@@ -574,6 +744,8 @@ def build(clouds_dir, kinds=SHOWN_KINDS):
     events.sort(key=lambda e: -e["_score"])
     events = events[:MAX_EVENTS]
     used = {s for e in events for s in e["source"].split("/")}
+    if aurora_doc:
+        used.add("SWPC")
     if len(events) < 3:
         for s in (s for s in STANDING if s["kind"] in kinds):
             events.append(dict(s, start="", updated="", source="", standing=True))
@@ -582,6 +754,8 @@ def build(clouds_dir, kinds=SHOWN_KINDS):
     doc = {"generated": iso(NOW), "quiet": not any(not e["standing"] for e in events), "events": events,
            "credits": [CREDITS[k] for k in CREDITS if k in used] or [CREDITS["GDACS"]],
            "failed": [k for k, v in ok.items() if not v]}
+    if aurora_doc:
+        doc["aurora"] = aurora_doc
     # Trim from the least important end until it fits.
     while len(dump(doc)) > MAX_BYTES and doc["events"]:
         doc["events"].pop()
