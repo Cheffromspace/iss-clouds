@@ -33,6 +33,8 @@ jobs:
       - run: python forecast_layers.py --out site || true
       # Never lets a broken events source stop the clouds.
       - run: python events_feed.py --out site --clouds-dir site || true
+      # Storm replays for the observatory (baked once by replay_bake.py from NOAA GridSat-B1; kept in this repo).
+      - run: cp -r replays site/
       - name: Publish
         run: |
           cd site
