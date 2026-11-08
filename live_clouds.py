@@ -99,8 +99,11 @@ def clouds(now, past):
     # Counts run 0-255 with colder (higher) as brighter. Clear sky is the lowest count seen at this hour lately.
     clear = np.nanmin(np.stack(past + [now]), axis=0) if past else np.full_like(now, 70.0)
     rise = now - clear
-    # A rise over clear sky means cloud. Very cold tops are cloud whatever the clear-sky value says.
-    op = np.maximum(smoothstep(6.0, 45.0, rise), smoothstep(150.0, 205.0, now))
+    # A rise over clear sky means cloud; how opaque it looks depends mostly on how cold (deep) its top is. Thin cirrus is
+    # cold but see-through, low and mid cloud only modestly bright in infrared, deep convection near opaque. Scaling the
+    # cover by coldness (owner, 2026-11-08: the clouds were blown out, nearly all solid white; checked against GOES-West
+    # visible over Tropical Storm Pena) keeps the storm cores bright and the cirrus and broken cloud between them grey.
+    op = np.clip(smoothstep(8.0, 60.0, rise) * (0.35 + 0.65 * smoothstep(110.0, 200.0, now)), 0.0, 1.0)
     top = np.clip(np.maximum(rise, (now - 70.0) * 0.8) / COUNTS_PER_KM, 0.5, TOP_KM)
     return np.nan_to_num(op, nan=0.0), np.nan_to_num(top, nan=0.5)
 
@@ -323,6 +326,48 @@ def save_flow(u, v, path):
     Image.fromarray(px).save(path, optimize=True)
 
 
+def encode(op, top, lat, lon):
+    """The published image (H x W x 3 uint8: opacity, top / TOP_KM, the 128 marker) and the opacity map, from the
+    deseamed opacity and cloud-top height on the source grid."""
+    # Cover can step sharply from one source pixel to the next, and the sky shader's threshold would trace the pixel
+    # staircase (right angles). A slight blur spreads each edge over a couple of pixels, so the shader's noise shapes
+    # it instead of the grid.
+    op = ndimage.gaussian_filter(op, 0.8)   # 1.3 (2026-11-03) was about twice as soft as the source
+    img = to_equirect(op, lat, lon)
+    # Heights come in whole counts (about 100 m), which show as contour rings where lighting changes fast with height
+    # (at sunset). Smooth them, and dither both channels so 8 bits don't band.
+    top = ndimage.gaussian_filter(top, 1.5)
+    height = to_equirect(top / TOP_KM, lat, lon)
+    rng = np.random.default_rng(0)
+    img = img + (rng.random(img.shape) - 0.5) / 255.0
+    height = height + (rng.random(height.shape) - 0.5) / 255.0
+    px = np.zeros((H, W, 3), np.uint8)
+    px[..., 0] = (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
+    px[..., 1] = (np.clip(height, 0, 1) * 255 + 0.5).astype(np.uint8)
+    # Blue is a constant 0.5 so the sky shader can tell whether VRChat decoded the image as sRGB (it then reads ~0.21)
+    # and undo it.
+    px[..., 2] = 128
+    return px, img
+
+
+def fetch_hour(folder, t, past_days=PAST_DAYS):
+    """Downloads the infrared mosaic for UTC hour t and the same hour on up to past_days earlier days.
+    Returns (now_path, [past paths]), or None if hour t isn't in the bucket."""
+    k = keys(t.strftime("GMGSI_LW/%Y/%m/%d/%H/"))
+    if not k:
+        return None
+    now = os.path.join(folder, f"LW_{t:%Y%m%d%H}.nc")
+    urllib.request.urlretrieve(f"{BUCKET}/{k[-1]}", now)
+    past = []
+    for day in range(1, past_days + 1):
+        k = keys((t - datetime.timedelta(days=day)).strftime("GMGSI_LW/%Y/%m/%d/%H/"))
+        if k:
+            path = os.path.join(folder, f"LW_{t:%Y%m%d%H}_{day}.nc")
+            urllib.request.urlretrieve(f"{BUCKET}/{k[-1]}", path)
+            past.append(path)
+    return now, past
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("now", nargs="?")
@@ -357,24 +402,7 @@ def main():
             flow = cloud_flow(now, load(a.prev)[0], op, lat, lon)
         except Exception as e:   # motion is a nicety: never lose the clouds over it
             print(f"cloud motion skipped: {e}")
-    # Cover is nearly all-or-nothing from one source pixel to the next, so an edge falls inside a single pixel and the
-    # sky shader's threshold traces the pixel staircase (right angles). A slight blur spreads each edge over a few
-    # pixels, so the shader's noise shapes it instead of the grid.
-    op = ndimage.gaussian_filter(op, 1.3)
-    img = to_equirect(op, lat, lon)
-    # Heights come in whole counts (about 100 m), which show as contour rings where lighting changes fast with height
-    # (at sunset). Smooth them, and dither both channels so 8 bits don't band.
-    top = ndimage.gaussian_filter(top, 1.5)
-    height = to_equirect(top / TOP_KM, lat, lon)
-    rng = np.random.default_rng(0)
-    img = img + (rng.random(img.shape) - 0.5) / 255.0
-    height = height + (rng.random(height.shape) - 0.5) / 255.0
-    px = np.zeros((H, W, 3), np.uint8)
-    px[..., 0] = (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
-    px[..., 1] = (np.clip(height, 0, 1) * 255 + 0.5).astype(np.uint8)
-    # Blue is a constant 0.5 so the sky shader can tell whether VRChat decoded the image as sRGB (it then reads ~0.21)
-    # and undo it.
-    px[..., 2] = 128
+    px, img = encode(op, top, lat, lon)
     os.makedirs(a.out, exist_ok=True)
     Image.fromarray(px[:, : W // 2]).save(os.path.join(a.out, "west.png"), optimize=True)
     Image.fromarray(px[:, W // 2 :]).save(os.path.join(a.out, "east.png"), optimize=True)
