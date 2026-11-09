@@ -71,9 +71,15 @@
   "atlas_6.png"
  ],
  "source": "NOAA GridSat-B1 CDR (infrared), via AWS Open Data",
+ "box": [
+  -110.0,
+  8.0,
+  -50.0,
+  38.0
+ ],
  "go": {
-  "lat": 25.5,
-  "lon": -82.0,
-  "alt_km": 1000.0
+  "lat": 25.0,
+  "lon": -76.0,
+  "alt_km": 2500
  }
 }
